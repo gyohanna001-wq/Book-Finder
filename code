@@ -1,0 +1,464 @@
+
+import sys
+import os
+import requests
+from urllib.parse import quote_plus
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import (
+    QFont, QPixmap, QPainter, QLinearGradient, QColor
+)
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QLineEdit,
+    QPushButton, QVBoxLayout, QHBoxLayout,
+    QScrollArea, QGridLayout, QFrame, QMessageBox
+)
+
+API_URL = "https://api.apileague.com/search-books"
+API_KEY = os.getenv("BOOK_API_KEY", "7c053eb521ae4ba29bea93b8f5e5a982")
+
+COLORS = {
+    "purple": "#6D5AE6",
+    "deep_purple": "#4937B8",
+    "blue": "#4388F5",
+    "pink": "#E879C6",
+    "text": "#29234D",
+    "muted": "#777394",
+    "border": "#E4DFFF",
+}
+
+
+class GradientWidget(QWidget):
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        gradient = QLinearGradient(
+            0, 0, self.width(), self.height()
+        )
+        gradient.setColorAt(0.0, QColor("#4937B8"))
+        gradient.setColorAt(0.5, QColor("#6D5AE6"))
+        gradient.setColorAt(1.0, QColor("#4388F5"))
+        painter.fillRect(self.rect(), gradient)
+
+
+class BookWorker(QThread):
+    results_ready = pyqtSignal(list)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        if not API_KEY:
+            self.error_occurred.emit(
+                "API key not found.\n\n"
+                "Set the BOOK_API_KEY environment variable."
+            )
+            return
+
+        try:
+            response = requests.get(
+                API_URL,
+                headers={"x-api-key": API_KEY},
+                params={
+                    "query": self.query,
+                    "number": 20,
+                    "offset": 0,
+                },
+                timeout=20,
+            )
+
+            if response.status_code in (401, 403):
+                self.error_occurred.emit(
+                    "API authentication failed. Check your API key "
+                    "and API League plan."
+                )
+                return
+
+            if response.status_code == 402:
+                self.error_occurred.emit(
+                    "Your API plan may not allow this request."
+                )
+                return
+
+            if response.status_code == 429:
+                self.error_occurred.emit(
+                    "API usage limit reached. Try again later."
+                )
+                return
+
+            response.raise_for_status()
+            data = response.json()
+
+            books = data.get("books", [])
+            results = []
+
+            def flatten(items):
+                for item in items:
+                    if isinstance(item, dict):
+                        results.append(item)
+                    elif isinstance(item, list):
+                        flatten(item)
+
+            if isinstance(books, list):
+                flatten(books)
+
+            self.results_ready.emit(results)
+
+        except requests.exceptions.Timeout:
+            self.error_occurred.emit(
+                "The request timed out. Please try again."
+            )
+        except requests.exceptions.RequestException as error:
+            self.error_occurred.emit(
+                f"Could not connect to the API:\n{error}"
+            )
+        except ValueError:
+            self.error_occurred.emit(
+                "The API returned an unexpected response."
+            )
+
+
+class BookCard(QFrame):
+    def __init__(self, book):
+        super().__init__()
+
+        self.book = book
+        self.setObjectName("bookCard")
+        self.setMinimumWidth(205)
+        self.setMaximumWidth(245)
+        self.setMinimumHeight(405)
+
+        self.setStyleSheet("""
+            QFrame#bookCard {
+                background-color: white;
+                border: 1px solid #E4DFFF;
+                border-radius: 18px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # Book cover
+        cover = QLabel()
+        cover.setFixedSize(145, 175)
+        cover.setAlignment(Qt.AlignCenter)
+        cover.setStyleSheet("""
+            background-color: #F0EDFF;
+            color: #6D5AE6;
+            border-radius: 10px;
+        """)
+
+        image_url = book.get("image")
+
+        if image_url:
+            try:
+                image_response = requests.get(
+                    image_url, timeout=8
+                )
+                image_response.raise_for_status()
+
+                pixmap = QPixmap()
+                if pixmap.loadFromData(image_response.content):
+                    cover.setPixmap(
+                        pixmap.scaled(
+                            cover.size(),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                    )
+                else:
+                    cover.setText("No cover")
+            except requests.exceptions.RequestException:
+                cover.setText("Cover unavailable")
+        else:
+            cover.setText("No cover available")
+
+        layout.addWidget(cover, alignment=Qt.AlignCenter)
+
+        # Book title
+        title_text = book.get("title") or "Untitled book"
+        title = QLabel(title_text)
+        title.setWordWrap(True)
+        title.setAlignment(Qt.AlignCenter)
+        title.setFont(QFont("Arial", 10, QFont.Bold))
+        title.setStyleSheet(
+            "color: #29234D; background: transparent; border: none;"
+        )
+        layout.addWidget(title)
+
+        # Book ID
+        book_id = QLabel(
+            f"Book ID: {book.get('id', 'Unknown')}"
+        )
+        book_id.setAlignment(Qt.AlignCenter)
+        book_id.setStyleSheet(
+            "color: #777394; font-size: 10px; border: none;"
+        )
+        layout.addWidget(book_id)
+
+        # Search links for purchasing and reading
+        safe_title = quote_plus(title_text)
+
+        buy_url = (
+            "https://www.google.com/search?tbm=shop&q="
+            + safe_title
+        )
+        read_url = (
+            "https://www.google.com/search?q="
+            + safe_title
+            + "+read+online+preview+ebook"
+        )
+
+        buy_button = QPushButton("🛍 Buy This Book")
+        buy_button.setCursor(Qt.PointingHandCursor)
+        buy_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6D5AE6;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4937B8;
+            }
+        """)
+        buy_button.clicked.connect(
+            lambda checked=False, url=buy_url:
+                self.open_link(url)
+        )
+
+        read_button = QPushButton("📖 Read / Preview")
+        read_button.setCursor(Qt.PointingHandCursor)
+        read_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E879C6;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #D85DB5;
+            }
+        """)
+        read_button.clicked.connect(
+            lambda checked=False, url=read_url:
+                self.open_link(url)
+        )
+
+        layout.addWidget(buy_button)
+        layout.addWidget(read_button)
+        layout.addStretch()
+
+    def open_link(self, url):
+        import webbrowser
+        webbrowser.open(url)
+
+
+class BookFinder(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Book Finder")
+        self.resize(1100, 800)
+        self.setMinimumSize(780, 560)
+
+        self.background = GradientWidget()
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(self.background)
+
+        main_layout = QVBoxLayout(self.background)
+        main_layout.setContentsMargins(30, 25, 30, 25)
+        main_layout.setSpacing(16)
+
+        heading = QLabel("📚 Book Finder")
+        heading.setFont(QFont("Arial", 29, QFont.Bold))
+        heading.setStyleSheet(
+            "color: white; background: transparent;"
+        )
+
+        subtitle = QLabel(
+            "Discover, buy, and preview your next favorite book."
+        )
+        subtitle.setStyleSheet(
+            "color: #EAE7FF; font-size: 13px; background: transparent;"
+        )
+
+        main_layout.addWidget(heading)
+        main_layout.addWidget(subtitle)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(12)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Search by book title, topic, or author..."
+        )
+        self.search_input.setMinimumHeight(48)
+        self.search_input.setStyleSheet("""
+            QLineEdit {
+                background: white;
+                color: #29234D;
+                border: 2px solid #DCD5FF;
+                border-radius: 14px;
+                padding: 10px 15px;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #E879C6;
+            }
+        """)
+        self.search_input.returnPressed.connect(self.search_books)
+
+        self.search_button = QPushButton("🔍 Search Books")
+        self.search_button.setMinimumHeight(48)
+        self.search_button.setCursor(Qt.PointingHandCursor)
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background: #E879C6;
+                color: white;
+                border: none;
+                border-radius: 14px;
+                padding: 12px 22px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #D85DB5;
+            }
+            QPushButton:disabled {
+                background: #B9ACDA;
+            }
+        """)
+        self.search_button.clicked.connect(self.search_books)
+
+        search_row.addWidget(self.search_input, 1)
+        search_row.addWidget(self.search_button)
+        main_layout.addLayout(search_row)
+
+        self.status_label = QLabel(
+            "Search for a book to get started."
+        )
+        self.status_label.setStyleSheet(
+            "color: white; font-size: 14px; background: transparent;"
+        )
+        main_layout.addWidget(self.status_label)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,55);
+                width: 12px;
+                margin: 3px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #DCD5FF;
+                min-height: 30px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: white;
+            }
+        """)
+
+        self.results_widget = QWidget()
+        self.results_widget.setStyleSheet(
+            "background: transparent;"
+        )
+
+        self.grid = QGridLayout(self.results_widget)
+        self.grid.setContentsMargins(6, 6, 6, 6)
+        self.grid.setSpacing(18)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        self.scroll_area.setWidget(self.results_widget)
+        main_layout.addWidget(self.scroll_area, 1)
+
+        self.worker = None
+
+    def clear_results(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def search_books(self):
+        query = self.search_input.text().strip()
+
+        if not query:
+            QMessageBox.information(
+                self, "Book Finder",
+                "Please enter a title, topic, or author."
+            )
+            return
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.clear_results()
+        self.search_button.setEnabled(False)
+        self.status_label.setText("Searching for books...")
+
+        self.worker = BookWorker(query)
+        self.worker.results_ready.connect(self.show_results)
+        self.worker.error_occurred.connect(self.show_error)
+        self.worker.finished.connect(self.search_finished)
+        self.worker.start()
+
+    def show_results(self, books):
+        self.clear_results()
+
+        if not books:
+            self.status_label.setText(
+                "No books found. Try another search."
+            )
+            return
+
+        columns = max(
+            1, self.scroll_area.viewport().width() // 250
+        )
+
+        for index, book in enumerate(books):
+            card = BookCard(book)
+            self.grid.addWidget(
+                card, index // columns, index % columns
+            )
+
+        self.status_label.setText(
+            f"Found {len(books)} books. Choose Buy or Read / Preview."
+        )
+
+    def show_error(self, message):
+        self.status_label.setText(
+            "Search could not be completed."
+        )
+        QMessageBox.warning(self, "Book Finder", message)
+
+    def search_finished(self):
+        self.search_button.setEnabled(True)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Arial", 10))
+
+    window = BookFinder()
+    window.show()
+
+    sys.exit(app.exec_())
